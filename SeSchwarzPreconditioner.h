@@ -34,6 +34,7 @@
 
 SE_NAMESPACE_BEGIN
 
+// 實現 GPU-based Multilevel Additive Schwarz (MAS) 預處理器的主要類別。
 class SeSchwarzPreconditioner
 {
 
@@ -53,13 +54,23 @@ public:
 public:
 
 	//==== call before time integration once a frame
+	// [對應論文 Section 5: Multilevel Domain Construction]
+	// 初始化預處理器，包含記憶體配置與初步的空間排序。
 	void AllocatePrecoditioner(int numVerts, int numEdges, int numFaces);
 
 	//==== call before PCG iteration loop
+	// [對應論文 Section 6: Matrix Precomputation]
+	// [對應論文 Algorithm 1: Matrix Precomputation]
+	// 在每次 PCG 迭代前呼叫，負責組裝系統矩陣並計算子區域矩陣的逆 (Inversion)。
+	// 包含 PrepareCollisionHessian, PrepareHessian, LDLtInverse512 等步驟。
 	void PreparePreconditioner(const SeMatrix3f* diagonal, const SeMatrix3f* csrOffDiagonals, const int* csrRanges,
 		const EfSet* efSets, const EeSet* eeSets, const VfSet* vfSets, unsigned int* efCounts, unsigned int* eeCounts, unsigned int* vfCounts);
 
 	//==== call during PCG iterations
+	// [對應論文 Section 7: Runtime Preconditioning]
+	// [對應論文 Equation 5]
+	// 執行預處理運算： z = M_{MAS}^{-1} * r
+	// M_{MAS}^{-1} = M_{(0)}^{-1} + Sum( C_{(l)}^T * M_{(l)}^{-1} * C_{(l)} )
 	void Preconditioning(SeVec3fSimd* z, const SeVec3fSimd* residual, int dim);
 
 private:
@@ -70,13 +81,16 @@ private:
 
 	int m_frameIndex = 0;
 
+	// [對應論文 Section 6.1] "In this work, we set M = 32"
+	// 每個子區域 (Domain) 的大小 (bank size)。
 	int m_totalSz = 0;
+	// [對應論文 Section 5.2] 層級總數 (L)。
 	int m_numLevel = 0;
 
 	int m_totalNumberClusters;
 
 	
-	SeAabb<SeVec3fSimd>					m_aabb;
+	SeAabb<SeVec3fSimd>					m_aabb; // 用於計算 Morton Code 的邊界框
 
 
 	SeArray2D<SeMatrix3f>				m_hessianMapped;
@@ -85,21 +99,27 @@ private:
 	SeArray2D<int>						m_mappedNeighbors;
 	SeArray2D<int>						m_mappedNeighborsRemain;
 
+	// [對應論文 Section 5.2]
+	// 儲存粗糙空間層級關係的表格，對應論文中的限制算子 C_(l) 或映射 map_(l)。
 	SeArray2D<int>						m_CoarseSpaceTables;
+
+	// 以下是用於層級建構 (Algorithm 2) 的輔助資料結構
 	std::vector<int>                    m_prefixOrignal;
-	std::vector<unsigned int>           m_fineConnectMask;
+	std::vector<unsigned int>           m_fineConnectMask;  // [對應 Section 5.2] 用於判斷連接性
 	std::vector<unsigned int>           m_nextConnectMsk;
 	std::vector<unsigned int>           m_nextPrefix;
 
 	std::vector<SeVec3fSimd>			m_mappedPos;
 
-	std::vector<Int4>					m_coarseTables;
-	std::vector<int>					m_goingNext;
+
+	std::vector<Int4>					m_coarseTables; // 壓縮後的層級映射表
+	std::vector<int>					m_goingNext; // 指向下一層級對應節點的索引
 	std::vector<int>					m_denseLevel;
 	std::vector<Int2>					m_levelSize;  // .x = current level size    .y = (prefixed) current level begin index
 
-	std::vector<SeVec3fSimd>			m_mappedR;
-	std::vector<SeVec3fSimd>			m_mappedZ;
+	// 預處理過程中的暫存向量
+	std::vector<SeVec3fSimd>			m_mappedR; // [對應 Equation 5] 限制後的殘差 C_(l) * r
+	std::vector<SeVec3fSimd>			m_mappedZ; // [對應 Equation 5] 局部求解後的結果 y_(l)
 	std::vector<int>                    m_MapperSortedGetOriginal;          // sorted by morton
 	std::vector<int>                    m_mapperOriginalGetSorted;
 	std::vector<SeMorton64>             m_mortonCode;
@@ -176,5 +196,6 @@ private:
 
 	void CollectFinalZ(SeVec3fSimd* m_cgZ);
 };
+
 
 SE_NAMESPACE_END
