@@ -97,18 +97,31 @@ void SeSchwarzPreconditioner::PreparePreconditioner
 	LDLtInverse512();
 }
 
+// [對應論文 Equation 5: The MAS Preconditioner]
+// 公式：M_{MAS}^{-1} = M_{(0)}^{-1} + Sum( C_{(l)}^T M_{(l)}^{-1} C_{(l)} )
 void SeSchwarzPreconditioner::Preconditioning(SeVec3fSimd* z, const SeVec3fSimd* residual, int dim)
 {
 	Utility::MemsetZero(m_mappedZ); 
 	Utility::MemsetZero(m_mappedR);
 
+	// 步驟 1: 限制 (Restriction) / 分配
+	// [對應論文 Section 4 & 7] "Distributing the input x to every level"
+	// 實際上是在計算 C_{(l)} * r
 	BuildResidualHierarchy(residual);
 
+	// 步驟 2: 局部求解 (Local Solving)
+	// [對應論文 Section 7.1] "Performing the matrix-vector product in each domain"
+	// 計算 y_(l) = M_{d,(l)}^{-1} * x_(l)
 	SchwarzLocalXSym();
 
+	// 步驟 3: 插值 (Prolongation) 與 加總
+	// [對應論文 Equation 5 的求和部分]
+	// 將各層級的結果加總：z = Sum( y_(l) )
 	CollectFinalZ(z);
 }
 
+// [對應論文 Section 7.1: Symmetric Matrix-Vector Multiplication]
+// 實現論文 Fig 12 與 Fig 13 描述的優化版對稱矩陣向量乘法。
 void SeSchwarzPreconditioner::ComputeLevelNums(int bankSize)
 {
 	constexpr float SizeRatio = 1.5f;
@@ -1658,6 +1671,8 @@ void SeSchwarzPreconditioner::SchwarzLocalXSym()
 #ifdef WIN32
 			// ------------------------------------
 			// diagnal
+			// Phase 1: 對角線處理 (Diagonal processing)
+			// [對應論文 Fig 12 左圖] "process 32 matrix rows backward from the diagonal"
 			int off = blockIdx * triSz;
 			for (int it = 0; it < 12; it++)
 			{
@@ -1666,7 +1681,10 @@ void SeSchwarzPreconditioner::SchwarzLocalXSym()
 				diag = _mm256_mul_ps(diag, diagRhs);
 				_mm256_storeu_ps(&cacheOut[it * 8], diag);
 			}
-			off += 8 * 12;
+
+			// Phase 2: 非對角線處理 (Off-diagonal upward processing)
+            // [對應論文 Fig 12 右圖] "process matrix columns upward..."
+			off += 8 * 12;  // 這行結束後，開始讀取 off-diagonal 區(上三角)
 			for (int it = 0; it < 11; it++)
 			{
 				int xBg = it * 8;
@@ -1674,14 +1692,14 @@ void SeSchwarzPreconditioner::SchwarzLocalXSym()
 				__m256 sigularResult = _mm256_setzero_ps();
 				for (int scan = xBg + 1; scan <= (96 - 8); scan++)
 				{
-					__m256 mtx = _mm256_loadu_ps(&m_invSymR[off]);
+					__m256 mtx = _mm256_loadu_ps(&m_invSymR[off]); // 讀 off-diagonal
 					off += 8;
 
 					__m256 scanRhs = _mm256_loadu_ps(&cacheRhs[scan]);
 					sigularResult = _mm256_fmadd_ps(mtx, scanRhs, sigularResult);
 
 					__m256 scanResult = _mm256_loadu_ps(&cacheOut[scan]);
-					scanResult = _mm256_fmadd_ps(mtx, sigularRhs, scanResult);
+					scanResult = _mm256_fmadd_ps(mtx, sigularRhs, scanResult); // 使用 AVX 指令 _mm256_fmadd_ps 進行乘加運算, 對應「upward處理欄」的更新
 					_mm256_storeu_ps(&cacheOut[scan], scanResult);
 				}
 
@@ -1703,12 +1721,12 @@ void SeSchwarzPreconditioner::SchwarzLocalXSym()
 					float singularResult = 0.0f;
 					for (int h = (96 - 7 + lane); h < 96; h++)
 					{
-						float value = m_invSymR[off];
+						float value = m_invSymR[off]; // 讀上三角尾端
 						off++;
 						if (value)
 						{
 							singularResult += value * cacheRhs[h];
-							cacheOut[h] += value * sigularRhs;
+							cacheOut[h] += value * sigularRhs;  // 同樣是 off-diagonal 更新
 						}
 					}
 					cacheOut[xBg] += singularResult;
@@ -1725,12 +1743,14 @@ void SeSchwarzPreconditioner::SchwarzLocalXSym()
 				out.y = cacheOut[laneIdx * 3 + 1];
 				out.z = cacheOut[laneIdx * 3 + 2];
 
-				m_mappedZ[vid] = out;
+				m_mappedZ[vid] = out; // 將結果存回 m_mappedZ (對應各層的解向量 y_(l))
 			}
 
 		}
 }
 
+// [對應論文 Equation 5 的加總]
+// "Summing up the results at all levels into a joint output."
 void SeSchwarzPreconditioner::CollectFinalZ(SeVec3fSimd* m_cgZ)
 {
 	OMP_PARALLEL_FOR
@@ -1739,10 +1759,11 @@ void SeSchwarzPreconditioner::CollectFinalZ(SeVec3fSimd* m_cgZ)
 		{
 			unsigned int mappedIndex = m_MapperSortedGetOriginal[vid];
 
-			auto z = m_mappedZ[vid];
+			auto z = m_mappedZ[vid]; // 取出第 0 層結果
 
 			Int4 table = m_coarseTables[vid];
 
+			// 累加粗糙層級 (Coarser Levels) 的修正量
 			for (int l = 1; l < Math::Min(m_numLevel, 4); l++)
 			{
 				int now = table[l - 1];
@@ -1750,7 +1771,8 @@ void SeSchwarzPreconditioner::CollectFinalZ(SeVec3fSimd* m_cgZ)
 				z += m_mappedZ[now];
 			}
 
-			m_cgZ[mappedIndex] = z;
+			m_cgZ[mappedIndex] = z; // 最終結果
 		}
 }
+
 
