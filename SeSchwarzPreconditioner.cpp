@@ -210,15 +210,23 @@ void SeSchwarzPreconditioner::ComputeAABB()
 	}
 }
 
+// [對應論文 Section 5.1: Spatial Sorting]
+// 論文提到："Similar to [Wu et al. 2015], we choose to sort the nodes by their Morton codes first."
+// 目的：確保空間上相近的節點在記憶體中也是相鄰的，這是後續建立層級 (Hierarchy) 的基礎。
+
 void SeSchwarzPreconditioner::SpaceSort()
 {
-	FillSortingData();
-	DoingSort();
+	FillSortingData(); // 計算每個頂點的 Morton Code
+	DoingSort();       // 根據 Code 進行排序
 }
 
+// [對應論文 Section 5.1]
+// "We then obtain the 60-bit Morton code of each node by simply interleaving the bits of its cell indices."
 void SeSchwarzPreconditioner::FillSortingData()
 {
 	OMP_PARALLEL_FOR
+
+		// 計算 Morton Code 的實作
 
 		for (int vid = 0; vid < m_numVerts; ++vid)
 		{
@@ -412,18 +420,27 @@ void SeSchwarzPreconditioner::PrepareCollisionStencils(const EfSet* efSets, cons
 	MapCollisionStencilIndices(); //1
 }
 
+// [對應論文 Section 5.2: Coarse Space Construction]
+// 建構粗糙空間 (Coarse Space) 的層級。
+// 對應論文描述的 "Aggregation-based coarsening"，將節點聚類成超節點 (Supernodes)。
+
 void SeSchwarzPreconditioner::ReorderRealtime()
 {
 	Utility::MemsetZero(m_levelSize);
 
-	BuildConnectMaskL0();
+	BuildConnectMaskL0(); // 建立第 0 層的連接關係
 
+	// [對應論文 Section 5.2]
+	// "This solution removes false coupling artifacts."
+	// 這裡處理碰撞產生的額外連接，避免不必要的耦合影響層級結構。
 	BuildCollisionConnection(m_fineConnectMask.data(), nullptr); //2
 
 	PreparePrefixSumL0();
 
-	BuildLevel1();
+	BuildLevel1(); // 建立第一層粗糙空間 C_(1)
 
+	// [對應論文 Algorithm 2: Hierarchy Construction]
+	// 迴圈對應論文中遞迴建立 l > 1 層級的過程。
 	for (int level = 1; level < m_numLevel; level++)
 	{
 		Utility::MemsetZero(m_nextConnectMsk);
@@ -441,6 +458,9 @@ void SeSchwarzPreconditioner::ReorderRealtime()
 
 	TotalNodes();
 
+	// [對應論文 Section 5.2]
+	// "We collapse {map_l->l+1} to compute map_(l)..."
+	// 將多層映射表壓縮，讓程式可以直接查詢任一層的對應關係。
 	AggregationKernel();
 }
 
@@ -1226,6 +1246,9 @@ void SeSchwarzPreconditioner::PrepareCollisionHessian()
 		}
 }
 
+// [對應論文 Algorithm 1: Matrix Precomputation]
+// 負責組裝子區域矩陣 A_{d,(l)} = S_d * A_{(l)} * S_d^T
+
 void SeSchwarzPreconditioner::PrepareHessian(const SeMatrix3f* diagonal, const SeMatrix3f* csrOffDiagonals, const int* csrRanges)
 {
 
@@ -1235,6 +1258,9 @@ void SeSchwarzPreconditioner::PrepareHessian(const SeMatrix3f* diagonal, const S
 
 	OMP_PARALLEL_FOR
 
+		// [對應論文 Section 6.1: Matrix Assembly]
+		// "We check every 3x3 system matrix block A[i,j]... and add it into the... sub-matrix A_{d,(l)}"
+		// 程式碼遍歷矩陣區塊，根據層級映射 (m_goingNext) 將數值累加到對應層級的 Hessian 中。
 		for (int vid = nVC; vid < m_totalNumberClusters; ++vid)
 		{
 			auto oldDiagonal = m_additionalHessian32[vid];
@@ -1289,7 +1315,7 @@ void SeSchwarzPreconditioner::PrepareHessian(const SeMatrix3f* diagonal, const S
 					{
 						continue;
 					}
-					if (level <= 1) // ����block�ֲ��У�level 1��λ��Ҳһ�����ڱ��߳�
+					if (level <= 1) // 按照block分并行，level 1的位置也一定属于本线程
 						m_hessian32[otID % bank][myID] += mat;
 					else
 						Intrinsic::AtomicAdd(&m_hessian32[otID % bank][myID], mat);
@@ -1344,6 +1370,8 @@ void SeSchwarzPreconditioner::PrepareHessian(const SeMatrix3f* diagonal, const S
 	}
 }
 
+// [對應論文 Section 6.2: Fast Sub-Matrix Inversion]
+// 計算子矩陣的逆：L^{-T} D^{-1} L^{-1}
 void SeSchwarzPreconditioner::LDLtInverse512()
 {
 	const int triSz = (1 + 96) * 96 / 2 + 16 * 3;
@@ -1354,7 +1382,7 @@ void SeSchwarzPreconditioner::LDLtInverse512()
 
 		for (int block = 0; block < activeblockNum; block++)
 		{
-			float A[96][96] = {};
+			float A[96][96] = {}; // 1. 將資料載入暫存器 (A[][])
 
 			for (int x = 0; x < 32; x++)
 			{
@@ -1390,8 +1418,12 @@ void SeSchwarzPreconditioner::LDLtInverse512()
 			//	}
 			//}
 
-			// ������Ԫ
+			// 向下消元
+			// 2. 高斯消去法 (Gauss-Jordan Elimination)
+			// [對應論文 Page 7]
+            // "We apply Gauss-Jordan elimination... to get [U | L^-1]"
 #ifdef WIN32
+			// 使用 AVX 指令集進行 SIMD 平行化運算
 			for (int x = 0; x < 96; x++)
 			{
 				float diag = A[x][x];
@@ -1434,6 +1466,10 @@ void SeSchwarzPreconditioner::LDLtInverse512()
 
 			int off = block * triSz;
 			// output diagonal 
+			// 3. 計算 L^{-T} D^{-1} L^{-1}
+			// [對應論文 Page 7]
+            // "In the third step, we calculate L^{-T} D^{-1} L^{-1} by visiting every two columns..."
+			// 這裡計算出的結果存入 m_invSymR，使用論文 Fig 11 描述的 Compact Storage Format。
 			for (int it = 0; it < 12; it++)
 			{
 				int lc = 96 - it * 8;
@@ -1717,3 +1753,4 @@ void SeSchwarzPreconditioner::CollectFinalZ(SeVec3fSimd* m_cgZ)
 			m_cgZ[mappedIndex] = z;
 		}
 }
+
