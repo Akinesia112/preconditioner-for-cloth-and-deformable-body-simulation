@@ -55,6 +55,9 @@ void SeSchwarzPreconditioner::AllocatePrecoditioner(int numVerts, int numEdges, 
 
 	ComputeTotalAABB();
 
+	// [對應論文 Section 5.1: Domain Partitioning]
+    // "We choose to sort the nodes by their Morton codes first." 
+    // 進行空間排序以優化記憶體局部性 (Locality) 並作為分群基礎。
 	SpaceSort();
 
 	ComputeInverseMapper();
@@ -79,7 +82,9 @@ void SeSchwarzPreconditioner::PreparePreconditioner
 	PrepareCollisionStencils(efSets, eeSets, vfSets, efCounts, eeCounts, vfCounts);
 
 	//====
-
+	// [對應論文 Section 5.2: Coarse Space Construction]
+    // "construct a Nicolaides' coarse space by grouping nodes... into supernodes." [cite: 395]
+    // 建立多層級結構 (Hierarchy)。
 	ReorderRealtime();
 	
 	//====
@@ -90,15 +95,26 @@ void SeSchwarzPreconditioner::PreparePreconditioner
 	
 	//====
 
+	// [對應論文 Section 6: Matrix Precomputation]
+    // 準備每個子區域 (Domain) 的矩陣與其反矩陣。
 	PrepareCollisionHessian(); //3
 
+	// [對應論文 Algorithm 1: Matrix Precomputation]
+    // 步驟 1: 組裝子矩陣 A_{d,(l)}
 	PrepareHessian(diagonal, csrOffDiagonals, csrRanges);
 
+	// [對應論文 Algorithm 1 & Section 6.2]
+    // 步驟 2 & 3: 計算子矩陣的逆 M_{d,(l)}^{-1}
 	LDLtInverse512();
 }
 
+// =========================================================
+// SECTION 7: RUNTIME PRECONDITIONING
+// =========================================================
+
 // [對應論文 Equation 5: The MAS Preconditioner]
 // 公式：M_{MAS}^{-1} = M_{(0)}^{-1} + Sum( C_{(l)}^T M_{(l)}^{-1} C_{(l)} )
+// 這是執行時期的主要入口函數。
 void SeSchwarzPreconditioner::Preconditioning(SeVec3fSimd* z, const SeVec3fSimd* residual, int dim)
 {
 	Utility::MemsetZero(m_mappedZ); 
@@ -223,10 +239,13 @@ void SeSchwarzPreconditioner::ComputeAABB()
 	}
 }
 
+// =========================================================
+// SECTION 5.1: DOMAIN PARTITIONING (SPATIAL SORTING)
+// =========================================================
+
 // [對應論文 Section 5.1: Spatial Sorting]
 // 論文提到："Similar to [Wu et al. 2015], we choose to sort the nodes by their Morton codes first."
 // 目的：確保空間上相近的節點在記憶體中也是相鄰的，這是後續建立層級 (Hierarchy) 的基礎。
-
 void SeSchwarzPreconditioner::SpaceSort()
 {
 	FillSortingData(); // 計算每個頂點的 Morton Code
@@ -243,6 +262,8 @@ void SeSchwarzPreconditioner::FillSortingData()
 
 		for (int vid = 0; vid < m_numVerts; ++vid)
 		{
+			// [對應論文 Section 5.1]
+            // 將座標正規化後編碼為 Morton Code
 			SeVec3fSimd temp = (m_positions[vid] - m_aabb.Lower) / m_aabb.Extent();
 
 			SeMorton64 mt;
@@ -433,19 +454,23 @@ void SeSchwarzPreconditioner::PrepareCollisionStencils(const EfSet* efSets, cons
 	MapCollisionStencilIndices(); //1
 }
 
+// =========================================================
+// SECTION 5.2: COARSE SPACE CONSTRUCTION
+// =========================================================
+
 // [對應論文 Section 5.2: Coarse Space Construction]
 // 建構粗糙空間 (Coarse Space) 的層級。
 // 對應論文描述的 "Aggregation-based coarsening"，將節點聚類成超節點 (Supernodes)。
-
 void SeSchwarzPreconditioner::ReorderRealtime()
 {
 	Utility::MemsetZero(m_levelSize);
 
 	BuildConnectMaskL0(); // 建立第 0 層的連接關係
 
-	// [對應論文 Section 5.2]
+	// [對應論文 Section 5.2 & Fig 6]
 	// "This solution removes false coupling artifacts."
-	// 這裡處理碰撞產生的額外連接，避免不必要的耦合影響層級結構。
+	// "check every domain-sized supernode... and split it... if they are not actually connected."
+	// 這裡處理碰撞產生的額外連接，利用碰撞與拓撲連接資訊來修正 Morton Code 分群可能產生的錯誤耦合 (Artifacts)，避免不必要的耦合影響層級結構。
 	BuildCollisionConnection(m_fineConnectMask.data(), nullptr); //2
 
 	PreparePrefixSumL0();
@@ -458,8 +483,9 @@ void SeSchwarzPreconditioner::ReorderRealtime()
 	{
 		Utility::MemsetZero(m_nextConnectMsk);
 
-		BuildConnectMaskLx(level);
+		BuildConnectMaskLx(level); // Coarsening connections
 
+		// 在每一層都進行連通性檢查以避免錯誤聚合
 		BuildCollisionConnection(m_nextConnectMsk.data(), m_CoarseSpaceTables[level - 1]);
 
 		NextLevelCluster(level);
@@ -472,7 +498,8 @@ void SeSchwarzPreconditioner::ReorderRealtime()
 	TotalNodes();
 
 	// [對應論文 Section 5.2]
-	// "We collapse {map_l->l+1} to compute map_(l)..."
+	// "We collapse {map_l->l+1} to compute map_(l) from level 0 directly."
+	// 建立直接從 Level 0 到任意 Level l 的映射表，方便並行計算。
 	// 將多層映射表壓縮，讓程式可以直接查詢任一層的對應關係。
 	AggregationKernel();
 }
@@ -1259,13 +1286,18 @@ void SeSchwarzPreconditioner::PrepareCollisionHessian()
 		}
 }
 
+// =========================================================
+// SECTION 6: MATRIX PRECOMPUTATION
+// =========================================================
+
 // [對應論文 Algorithm 1: Matrix Precomputation]
 // 負責組裝子區域矩陣 A_{d,(l)} = S_d * A_{(l)} * S_d^T
 
 void SeSchwarzPreconditioner::PrepareHessian(const SeMatrix3f* diagonal, const SeMatrix3f* csrOffDiagonals, const int* csrRanges)
 {
 
-	const unsigned int bank = 32;
+	// [對應論文 Section 6.1] "In this work, we set M = 32"
+	const unsigned int bank = 32; 
 
 	int nVC = (m_numVerts + 31) / 32 * 32;
 
@@ -1309,6 +1341,9 @@ void SeSchwarzPreconditioner::PrepareHessian(const SeMatrix3f* diagonal, const S
 				auto oldDiagonal = diagonal[vidOrig] + m_additionalHessian32[vid];
 				m_hessian32[vid % bank][vid] += oldDiagonal;   // self diagonal
 
+				// [對應論文 Algorithm 1]
+                // "check every 3x3 system matrix block A[i,j] and add it into the... sub-matrix A_{d,(l)}" 
+                // 這裡遍歷 CSR 格式的稀疏矩陣，將數值累加到對應的 m_hessian32 (即 A_{d,(l)})
 				for (int k = 1; k < oldNum; k++)
 				{
 					const unsigned int neighbor = m_mappedNeighbors[k][vid];
@@ -1318,6 +1353,7 @@ void SeSchwarzPreconditioner::PrepareHessian(const SeMatrix3f* diagonal, const S
 					unsigned int myID = vid;
 					unsigned int otID = neighbor;
 
+					// 根據層級映射表 m_goingNext 找到對應的粗糙層級與 Domain ID
 					while (myID / bank != otID / bank && level < m_numLevel)
 					{
 						level++;
@@ -1328,6 +1364,8 @@ void SeSchwarzPreconditioner::PrepareHessian(const SeMatrix3f* diagonal, const S
 					{
 						continue;
 					}
+
+					// 累加矩陣數值 (AtomicAdd 用於平行處理衝突)
 					if (level <= 1) // 按照block分并行，level 1的位置也一定属于本线程
 						m_hessian32[otID % bank][myID] += mat;
 					else
@@ -1384,6 +1422,8 @@ void SeSchwarzPreconditioner::PrepareHessian(const SeMatrix3f* diagonal, const S
 }
 
 // [對應論文 Section 6.2: Fast Sub-Matrix Inversion]
+// Per-Domain Sub-Matrix Inverse Calculation
+// [對應論文 Algorithm 1 (Lines 10-12)]
 // 計算子矩陣的逆：L^{-T} D^{-1} L^{-1}
 void SeSchwarzPreconditioner::LDLtInverse512()
 {
@@ -1395,7 +1435,7 @@ void SeSchwarzPreconditioner::LDLtInverse512()
 
 		for (int block = 0; block < activeblockNum; block++)
 		{
-			float A[96][96] = {}; // 1. 將資料載入暫存器 (A[][])
+			float A[96][96] = {}; // 1. 將資料載入暫存器 (A[][]), 載入 96x96 的子矩陣 A_{d,(l)} (因為 M=32, 32*3=96)
 
 			for (int x = 0; x < 32; x++)
 			{
@@ -1432,11 +1472,11 @@ void SeSchwarzPreconditioner::LDLtInverse512()
 			//}
 
 			// 向下消元
-			// 2. 高斯消去法 (Gauss-Jordan Elimination)
-			// [對應論文 Page 7]
-            // "We apply Gauss-Jordan elimination... to get [U | L^-1]"
 #ifdef WIN32
-			// 使用 AVX 指令集進行 SIMD 平行化運算
+			// 步驟 1: 高斯消去法 (Gauss-Jordan Elimination)
+            // [對應論文 Section 6.2] "We apply Gauss-Jordan elimination... to get [U | L^-1]"
+				
+			// 使用 AVX 指令集進行 SIMD 平行化運算優化消去過程
 			for (int x = 0; x < 96; x++)
 			{
 				float diag = A[x][x];
@@ -1479,9 +1519,9 @@ void SeSchwarzPreconditioner::LDLtInverse512()
 
 			int off = block * triSz;
 			// output diagonal 
-			// 3. 計算 L^{-T} D^{-1} L^{-1}
-			// [對應論文 Page 7]
-            // "In the third step, we calculate L^{-T} D^{-1} L^{-1} by visiting every two columns..."
+			// 步驟 2: 計算 L^{-T} D^{-1} L^{-1}
+			// [對應論文 Section 6.2] "In the third step, we calculate L^{-T} D^{-1} L^{-1} by visiting every two columns..."
+			// 利用 SIMD 計算對稱矩陣乘積
 			// 這裡計算出的結果存入 m_invSymR，使用論文 Fig 11 描述的 Compact Storage Format。
 			for (int it = 0; it < 12; it++)
 			{
@@ -1489,12 +1529,12 @@ void SeSchwarzPreconditioner::LDLtInverse512()
 				__m256 acc = _mm256_setzero_ps();
 				for (int l = 0; l < lc; l++)
 				{
-					__m256 a = _mm256_loadu_ps(A[95 - l] + it * 8);
+					__m256 a = _mm256_loadu_ps(A[95 - l] + it * 8); 
 					a = _mm256_mul_ps(a, a);
 					__m256 r = _mm256_set1_ps(diagonal[l]);
 					acc = _mm256_fmadd_ps(r, a, acc);
 				}
-				_mm256_storeu_ps(&m_invSymR[off + it * 8], acc);
+				_mm256_storeu_ps(&m_invSymR[off + it * 8], acc); // 存入 Compact Format
 			}
 			off += 12 * 8;
 			for (int it = 0; it < 12; it++)
@@ -1518,6 +1558,7 @@ void SeSchwarzPreconditioner::LDLtInverse512()
 			}
 #else
             //FIXME!
+			// 非 SIMD 版本的實作
             float diagonal[96] = {};
             int off = block * triSz;
 #endif
@@ -1646,6 +1687,13 @@ void SeSchwarzPreconditioner::BuildResidualHierarchy(const SeVec3fSimd* m_cgResi
 		//printf("\n");
 }
 
+// =========================================================
+// SECTION 7.1: PER-DOMAIN PRECONDITIONING
+// =========================================================
+
+// [對應論文 Section 7.1]
+// [對應論文 Fig 12 & 13: Symmetric Matrix-Vector Multiplication]
+// "Our solution is a novel symmetric-matrix-vector multiplication method with balanced workload and zero write conflict."
 void SeSchwarzPreconditioner::SchwarzLocalXSym()
 {
 	constexpr int blockDim = 32;
@@ -1662,6 +1710,7 @@ void SeSchwarzPreconditioner::SchwarzLocalXSym()
 			float cacheOut[96];
 			for (int laneIdx = 0; laneIdx < 32; ++laneIdx)
 			{
+				// 載入 RHS
 				int vid = laneIdx + blockIdx * blockDim;
 				auto rhs = m_mappedR[vid];
 				cacheRhs[laneIdx * 3 + 0] = rhs.x;
@@ -1698,6 +1747,7 @@ void SeSchwarzPreconditioner::SchwarzLocalXSym()
 					__m256 scanRhs = _mm256_loadu_ps(&cacheRhs[scan]);
 					sigularResult = _mm256_fmadd_ps(mtx, scanRhs, sigularResult);
 
+					// 利用對稱性同時更新兩邊
 					__m256 scanResult = _mm256_loadu_ps(&cacheOut[scan]);
 					scanResult = _mm256_fmadd_ps(mtx, sigularRhs, scanResult); // 使用 AVX 指令 _mm256_fmadd_ps 進行乘加運算, 對應「upward處理欄」的更新
 					_mm256_storeu_ps(&cacheOut[scan], scanResult);
@@ -1750,7 +1800,7 @@ void SeSchwarzPreconditioner::SchwarzLocalXSym()
 }
 
 // [對應論文 Equation 5 的加總]
-// "Summing up the results at all levels into a joint output."
+// [對應論文 Section 7] "Summing up the results at all levels into a joint output."
 void SeSchwarzPreconditioner::CollectFinalZ(SeVec3fSimd* m_cgZ)
 {
 	OMP_PARALLEL_FOR
@@ -1763,7 +1813,8 @@ void SeSchwarzPreconditioner::CollectFinalZ(SeVec3fSimd* m_cgZ)
 
 			Int4 table = m_coarseTables[vid];
 
-			// 累加粗糙層級 (Coarser Levels) 的修正量
+			// 累加粗糙層級 (Coarser Levels, Levels 1 to L) 的修正量
+			// 對應公式中的 Sum
 			for (int l = 1; l < Math::Min(m_numLevel, 4); l++)
 			{
 				int now = table[l - 1];
@@ -1774,5 +1825,6 @@ void SeSchwarzPreconditioner::CollectFinalZ(SeVec3fSimd* m_cgZ)
 			m_cgZ[mappedIndex] = z; // 最終結果
 		}
 }
+
 
 
