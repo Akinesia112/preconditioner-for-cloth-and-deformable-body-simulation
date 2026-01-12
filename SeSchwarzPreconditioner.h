@@ -120,17 +120,33 @@ private:
 	// 預處理過程中的暫存向量
 	std::vector<SeVec3fSimd>			m_mappedR; // [對應 Equation 5] 限制後的殘差 C_(l) * r
 	std::vector<SeVec3fSimd>			m_mappedZ; // [對應 Equation 5] 局部求解後的結果 y_(l)
+
+	// [對應論文 Section 5.1: Spatial Sorting]
+	// 儲存排序後的索引映射，用於確保記憶體局部性 (Locality)。
 	std::vector<int>                    m_MapperSortedGetOriginal;          // sorted by morton
 	std::vector<int>                    m_mapperOriginalGetSorted;
+
+	// [對應論文 Section 5.1] "We then obtain the 60-bit Morton code..."
 	std::vector<SeMorton64>             m_mortonCode;
 
+	// [對應論文 Section 6.1: Matrix Assembly]
+	// 儲存組裝後的子區域矩陣 A_{d,(l)}。
 	SeArray2D<SeMatrix3f>				m_hessian32;
+
+	// 處理碰撞產生的額外 Hessian 項
 	std::vector<SeMatrix3f>             m_additionalHessian32;
+
+	// [對應論文 Section 6.2]
+	// [對應論文 Figure 11: Alternative compact format]
+	// 儲存分解後或求逆後的矩陣 (L^{-T} D^{-1} L^{-1})，使用緊湊格式以節省頻寬。
 	std::vector<float>                  m_invSymR;
 
 	
 	int m_stencilNum;
 	int m_maxStencilNum;
+
+	// [對應論文 Section 5.2]
+	// 用於處理碰撞約束 (Collision constraints) 的模板，避免錯誤的耦合 (Artifacts)。
 	std::vector<Stencil>				m_stencils;
 	std::vector<Int5>					m_stencilIndexMapped;
 
@@ -140,12 +156,15 @@ private:
 
 	void DoAlllocation();
 
+	// [對應論文 Section 5.1: Spatial Sorting]
+	// "Similar to [Wu et al. 2015], we choose to sort the nodes by their Morton codes first."
 	void ComputeTotalAABB();
 
 	void ComputeAABB();
 
 	void SpaceSort();
 
+	// [對應論文 Section 5.1] 計算 Morton Codes。
 	void FillSortingData();
 
 	void DoingSort();
@@ -158,18 +177,25 @@ private:
 
 	void MapCollisionStencilIndices();
 
+	// [對應論文 Section 5.2: Coarse Space Construction]
+	// "construct a Nicolaides' coarse space by grouping nodes..."
+	// 建構多層級結構，包含處理碰撞連接。
 	void ReorderRealtime();
 
 
 
 	void BuildConnectMaskL0();
 
+	// [對應論文 Section 5.2] 
+	// "check every domain-sized supernode... and split it... if they are not actually connected."
+	// 處理碰撞導致的連接性更新。
 	void BuildCollisionConnection(unsigned int* pConnect, const int* pCoarseTable);
 
 	void PreparePrefixSumL0();
 
 	void BuildLevel1();
 
+	// [對應論文 Algorithm 2] 建構第 l 層的連接遮罩。
 	void BuildConnectMaskLx(int level);
 
 	void NextLevelCluster(int level);
@@ -180,22 +206,36 @@ private:
 
 	void TotalNodes();
 
+	// [對應論文 Section 5.2] "We collapse {map_l->l+1} to compute map_(l)..."
+	// 聚合層級映射表。
 	void AggregationKernel();
 
 	void AdditionalSchwarzHessian2(SeMatrix3f hessian, std::vector<SeMatrix3f>& pAdditionalHessian, SeArray2D<SeMatrix3f>& pDenseHessian, int v1, int v2, const std::vector<int>& pGoingNext, int nLevel, int vNum);
 
 	void PrepareCollisionHessian();
 
+	// [對應論文 Algorithm 1: Matrix Precomputation]
+	// 步驟 1-9: 組裝 Hessian 矩陣。
 	void PrepareHessian(const SeMatrix3f* diagonal, const SeMatrix3f* csrOffDiagonals, const int* csrRanges);
-	
+
+	// [對應論文 Algorithm 1 & Section 6.2]
+	// 步驟 10-12: 計算子矩陣的逆 (Fast Sub-Matrix Inversion)。
 	void LDLtInverse512();
 
+	// [對應論文 Equation 5 & Section 7]
+	// 準備殘差層級 (C_(l) * r)。
 	void BuildResidualHierarchy(const SeVec3fSimd* m_cgResidual);
 
+	// [對應論文 Section 7.1: Symmetric Matrix-Vector Multiplication]
+	// [對應論文 Figure 12 & 13]
+	// 執行局部的矩陣向量乘法求解。
 	void SchwarzLocalXSym();
 
+	// [對應論文 Equation 5]
+	// "Summing up the results at all levels into a joint output."
 	void CollectFinalZ(SeVec3fSimd* m_cgZ);
 };
 
 
 SE_NAMESPACE_END
+
