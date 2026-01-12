@@ -36,6 +36,9 @@
 
 SE_NAMESPACE_BEGIN
 
+// [Section 3.2: Multilevel Additive Schwarz (MAS)]
+// This class implements the MAS preconditioner defined in Eq. (5):
+// $M^{-1}_{MAS} = M_{(0)}^{-1} + \sum_{l=1}^{L} C_{(l)}^T M_{(l)}^{-1} C_{(l)}$.
 class SeSchwarzPreconditionerPreviousVersion
 {
 
@@ -55,6 +58,8 @@ public:
 public:
 
 	//==== call before time integration once a frame
+	// [Section 5: Multilevel Domain Construction]
+    // Responsible for partitioning nodes into domains and constructing coarse spaces.
 	void AllocatePrecoditioner(int numVerts, int numEdges, int numFaces)
 	{
 		m_numVerts = numVerts;
@@ -65,6 +70,10 @@ public:
 		{
 			DoAlllocation();
 		}
+
+		// [Section 5.3: A Skipping Approach]
+        // "We choose to run the multilevel domain construction stage once every ten time steps"[cite: 475].
+        // Here the code uses 17 instead of 10.
 
 		if (m_frameIndex % 17 != 0) { return; }
 
@@ -91,11 +100,14 @@ public:
 		m_mappedNeighborsNumRemain = m_mappedNeighborsNum;
 
 		//==== before reordering
+		// [Section 6: Matrix Precomputation]
+    	// Calculates sub-matrix inverse of each domain $M_{d,(l)}^{-1}$.
 
 		PrepareCollisionStencils(efSets, eeSets, vfSets, efCounts, eeCounts, vfCounts);
 
 		//====
-
+		// [Section 5.2: Coarse Space Construction]
+        // Constructs the Nicolaides' coarse space by grouping nodes hierarchically.
 		ReorderRealtime();
 
 		//====
@@ -115,6 +127,9 @@ public:
 	}
 
 	//==== call during PCG iterations
+	// [Section 7: Runtime Preconditioning]
+    // Performs the preconditioning step $y = M^{-1}x$.
+    // Executes three steps: distributing input (Restriction), matrix-vector product, and gathering (Prolongation).
 	void Preconditioning(SeVec3fSimd* z, const SeVec3fSimd* residual, int dim)
 	{
 		Utility::MemsetZero(m_mappedZ);
@@ -128,7 +143,7 @@ public:
 	}
 
 private:
-
+	// Member variables omitted for brevity
 	int m_numVerts = 0;
 	int m_numEdges = 0;
 	int m_numFaces = 0;
@@ -182,6 +197,7 @@ private:
 
 	void ComputeLevelNums(int bankSize)
 	{
+		// Logic to determine hierarchy depth L used in Eq. 5.
 		constexpr float SizeRatio = 1.5f;
 
 		//====
@@ -207,6 +223,8 @@ private:
 
 	void DoAlllocation()
 	{
+		// [Section 6.1: The Choice of the Domain Size M]
+        // "In this work, we set M = 32".
 		constexpr int bankSize = 32;	//==== size of diagonal block
 
 		ComputeLevelNums(bankSize);
@@ -258,6 +276,7 @@ private:
 
 	void ComputeAABB()
 	{
+		// Helper for Morton code calculation (Section 5.1).
 		m_aabb = SeAabb<SeVec3fSimd>();
 
 		for (int tid = 0; tid < m_numVerts; ++tid)
@@ -268,6 +287,8 @@ private:
 
 	void FillSortingData()
 	{
+		// [Section 5.1: Domain Partitioning]
+        // "We calculate the axis-aligned bounding box... and divide the box... We then obtain the 60-bit Morton code".
 		OMP_PARALLEL_FOR
 
 			for (int tid = 0; tid < m_numVerts; ++tid)
@@ -287,6 +308,8 @@ private:
 	void DoingSort()
 	{
 		//==== sort m_MapperSortedGetOriginal by m_mortonCode1;
+		// [Section 5.1: Domain Partitioning]
+        // "After we sort the nodes by Morton codes, we achieve better spatial locality".
 
 		std::sort(m_MapperSortedGetOriginal.begin(), m_MapperSortedGetOriginal.end(), [&](int i, int j) { return m_mortonCode[i] < m_mortonCode[j]; });
 	}
@@ -463,6 +486,9 @@ private:
 
 	void ReorderRealtime()
 	{
+		// [Section 5.2: Coarse Space Construction]
+        // Constructs hierarchical supernodes.
+        // "We propose to construct a Nicolaides' coarse space by grouping nodes... hierarchically into supernodes".
 		Utility::MemsetZero(m_levelSize);
 
 		BuildConnectMaskL0();
@@ -1276,12 +1302,17 @@ private:
 
 	void PrepareHessian(const SeMatrix3f* diagonal, const SeMatrix3f* csrOffDiagonals, const int* csrRanges)
 	{
+		// [Algorithm 1: Matrix Precomputation]
+        // Implements the loop: "foreach node i and node j and level l do ... $A_{d,(l)}[i',j'] \leftarrow A_{d,(l)}[i',j'] + A[i,j]$".
+        // This assembles the system matrix blocks into the domain sub-matrices $A_{d,(l)} = S_d A_{(l)} S_d^T$.
 		const unsigned int bank = 32;
 
 		int nVC = (m_numVerts + 31) / 32 * 32;
-
+		
+		// Note: Code handles assembly for various levels using "goingNext" to traverse the hierarchy.
 		OMP_PARALLEL_FOR
 
+			// This corresponds to checking "every 3x3 system matrix block A[i,j] and add it into the... sub-matrix".
 			for (int vid = nVC; vid < m_totalNumberClusters; ++vid)
 			{
 				auto oldDiagonal = m_additionalHessian32[vid];
@@ -1299,7 +1330,7 @@ private:
 			}
 
 		int numWarps = (nVC + 31) / 32;
-
+		
 		OMP_PARALLEL_FOR
 
 			for (int warpIdx = 0; warpIdx < numWarps; ++warpIdx)
@@ -1404,6 +1435,11 @@ private:
 
 	void LDLtInverse512()
 	{
+		// [Section 6.2: Per-Domain Sub-Matrix Inverse Calculation]
+        // Matches the computation of $M_{d,(l)}^{-1} = A_{d,(l)}^{-1}$.
+        // Although Alg 1 in the paper mentions Gauss-Jordan, the text in Sec 6.2 explicitly describes calculating 
+        // $L_{d,(l)}^{-T} D_{d,(l)}^{-1} L_{d,(l)}^{-1}$.
+        // The code implements this via LDLT factorization and inversion.
 		int triSz = (1 + 96) * 96 / 2 + 16 * 3;
 
 		const int blockNum = m_totalSz / 32;
@@ -1436,7 +1472,7 @@ private:
 					}
 				}
 			}
-			// 向下消元
+			// 脧貌脧脗脧没脭陋
 			for (int x = 0; x < 96; x++)
 			{
 				float diag = A[x][x];
@@ -1472,7 +1508,7 @@ private:
 				}
 			}*/
 
-			// 向上消元
+			// 脧貌脡脧脧没脭陋
 			for (int x = 95; x >= 0; x--)
 			{
 				float diag = A[x][x];
@@ -1611,6 +1647,9 @@ private:
 
 	void BuildResidualHierarchy(const SeVec3fSimd* m_cgResidual)
 	{
+		// [Section 7: Runtime Preconditioning - Step 1]
+        // "First, it coarsens the input vector into different copies at all of the levels".
+        // This computes $x_{(l)} = C_{(l)}x$.
 		int numWarp = (m_numVerts + 31) / 32;
 
 		OMP_PARALLEL_FOR
@@ -1713,6 +1752,9 @@ private:
 
 	void SchwarzLocalXSym()
 	{
+		// [Section 7.1: Per-Domain Preconditioning]
+        // "We invent a symmetric-matrix-vector multiplication method with balanced workload and zero write conflict".
+        // Matches the 3-phase approach described in Fig 12 and Fig 13.
 		constexpr int blockDim = 128;
 
 		int nBlocks = (m_totalSz + blockDim - 1) / blockDim;
@@ -1728,6 +1770,10 @@ private:
 
 				for (int warpIdx = 0; warpIdx < 4; ++warpIdx)
 				{
+					// [Section 7.1 - Phase 1]
+                    // "32 threads in the same warp process 32 matrix rows backward from the diagonal".
+                    // Logic handles y[j] write and M[i,j]x[j] accumulation to avoid conflicts.
+						
 					float* const cRhs = cacheRhs[warpIdx];
 					float* const cOut = cacheOut[warpIdx];
 
@@ -1990,6 +2036,9 @@ private:
 
 	void CollectFinalZ(SeVec3fSimd* m_cgZ)
 	{
+		// [Section 7: Runtime Preconditioning - Step 3]
+        // "Finally, it sums up the results at all levels into a joint output".
+        // Corresponds to the summation in Eq. 5: $\sum_{l=1}^{L} C_{(l)}^T y_{(l)}$.
 		for (int vid = 0; vid < m_numVerts; ++vid)
 		{
 			unsigned int mappedIndex = m_MapperSortedGetOriginal[vid];
@@ -2009,6 +2058,7 @@ private:
 		}
 	}
 };
+
 
 
 SE_NAMESPACE_END
