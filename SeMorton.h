@@ -37,6 +37,11 @@ SE_NAMESPACE_BEGIN
 /**
  *	@brief	64-bit Morton-Code object.
  */
+
+// [對應論文 Section 5.1]
+// 用於將 3D 座標編碼為 64-bit 整數 (Morton Code/Z-order curve)，
+// 目的：將 3D 空間座標映射為 1D 整數 (Morton Code)，讓空間上相鄰的節點在記憶體中也能相鄰 (提升 Cache locality)。
+// 這也是後續 "Multilevel Domain Construction" 進行分群的基礎。
 class SE_ALIGN(8) SeMorton64
 {
 
@@ -58,10 +63,15 @@ public:
 	{
 		static_assert(precision <= 21, "The highest precision for 64-bit Morton code is 21.");
 
+		// 將浮點數座標量化為整數索引
 		x = Math::Clamp(x * (1ll << precision), 0.0f, (1ll << precision) - 1.0f);
 		y = Math::Clamp(y * (1ll << precision), 0.0f, (1ll << precision) - 1.0f);
 		z = Math::Clamp(z * (1ll << precision), 0.0f, (1ll << precision) - 1.0f);
 
+		// [對應論文 Section 5.1]
+		// "interleaving the bits of its cell indices"
+		// 將 x, y, z 的位元擴展並交錯。
+		// 這裡實作了位元交錯邏輯：例如精確度為 21 時，每個軸佔 21 bits，共 63 bits。
 		value_type xx = SeMorton64::ExpandBits(static_cast<value_type>(x)) << (66 - 3 * precision);
 		value_type yy = SeMorton64::ExpandBits(static_cast<value_type>(y)) << (65 - 3 * precision);
 		value_type zz = SeMorton64::ExpandBits(static_cast<value_type>(z)) << (64 - 3 * precision);
@@ -72,16 +82,25 @@ public:
 	}
 
 	//!	@brief	Encoded by the given 3d point located within the unit cube (full precision).
+	// Encode 函式實作了 "interleaving the bits" 的邏輯
+	// [對應論文 Section 5.1]
+	// "We then obtain the 60-bit Morton code of each node by simply interleaving the bits of its cell indices."
+	// 論文提到 60-bit 即每軸 20 bits，此程式碼使用每軸 21 bits 達到 63-bit 更高精度，原理完全相同
 	 void Encode(float x, float y, float z)
 	{
+		// 步驟 1: 量化 (Quantization)
+		// 將 [0,1] 的浮點數座標轉換為整數網格索引 (Cell Indices)
 		x = Math::Clamp(x * (1ll << 21), 0.0f, (1ll << 21) - 1.0f);
 		y = Math::Clamp(y * (1ll << 21), 0.0f, (1ll << 21) - 1.0f);
 		z = Math::Clamp(z * (1ll << 21), 0.0f, (1ll << 21) - 1.0f);
 
+		// 步驟 2: 擴展位元 (Bit Expansion)
 		value_type xx = SeMorton64::ExpandBits(static_cast<value_type>(x));
 		value_type yy = SeMorton64::ExpandBits(static_cast<value_type>(y));
 		value_type zz = SeMorton64::ExpandBits(static_cast<value_type>(z));
 
+		// 步驟 3: 交錯位元 (Interleaving)
+		// 組合結果：... Z1 Y1 X1 Z0 Y0 X0
 		m_Value = (xx << 2) + (yy << 1) + zz;
 	}
 
@@ -91,6 +110,10 @@ private:
 	 *	@brief	Expand bits by inserting two zeros after each bit.
 	 *	@e.g.	0000 0000 1111  ->  0010 0100 1001
 	 */
+	// [對應論文 Section 5.1 隱含的位元運算細節]
+	// 這是實現 Morton Code 核心的 "Bit Dilation" (位元擴張) 演算法。
+	// 將每個位元分開，中間插入兩個 0，以便隨後插入另外兩個軸的位元。
+	// 例如：輸入二進位 11，擴展後變為 001001。
 	static  value_type ExpandBits(value_type bits)
 	{
 		bits = (bits | (bits << 32)) & 0xFFFF00000000FFFFu;
@@ -104,5 +127,6 @@ private:
 
 	value_type		m_Value;
 };
+
 
 SE_NAMESPACE_END
